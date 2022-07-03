@@ -648,6 +648,7 @@ func mutateSampleLabels(lset labels.Labels, target *Target, honor bool, rc []*re
 	targetLabels := target.Labels()
 
 	if honor {
+		// 保留抓取到到label
 		for _, l := range targetLabels {
 			if !lset.Has(l.Name) {
 				lb.Set(l.Name, l.Value)
@@ -665,13 +666,16 @@ func mutateSampleLabels(lset labels.Labels, target *Target, honor bool, rc []*re
 		}
 
 		if len(conflictingExposedLabels) > 0 {
+			// 解决label冲突，具体做法是在抓取到的label前加上exported_前缀
 			resolveConflictingExposedLabels(lb, lset, targetLabels, conflictingExposedLabels)
 		}
 	}
 
+	// 对labels排序
 	res := lb.Labels()
 
 	if len(rc) > 0 {
+		// 执行relabel操作
 		res = relabel.Process(res, rc...)
 	}
 
@@ -1561,6 +1565,7 @@ loop:
 			// Hash label set as it is seen local to the target. Then add target labels
 			// and relabeling and store the final label set.
 			// relabel操作，返回最终持久化的label
+			// relabel比较耗时，所以序列首次出现时才进行relabel，然后缓存relabel后的序列元数据
 			lset = sl.sampleMutator(lset)
 
 			// The label set may be set to nil to indicate dropping.
