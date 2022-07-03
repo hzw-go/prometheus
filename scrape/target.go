@@ -45,20 +45,29 @@ const (
 )
 
 // Target refers to a singular HTTP or HTTPS endpoint.
+// 抓取监控数据的目标
 type Target struct {
 	// Labels before any processing.
+	// 未经过任何处理的label，包含服务发现相关label
 	discoveredLabels labels.Labels
 	// Any labels that are added to this target and its metrics.
+	// 经过relabel之后的label
 	labels labels.Labels
 	// Additional URL parameters that are part of the target URL.
+	// HTTP参数
 	params url.Values
 
-	mtx                sync.RWMutex
-	lastError          error
-	lastScrape         time.Time
+	mtx sync.RWMutex
+	// 最近一次抓取该target产生的异常
+	lastError error
+	// 最近一次抓取该target的时间戳
+	lastScrape time.Time
+	// 最近一次抓取该target的请求耗时
 	lastScrapeDuration time.Duration
-	health             TargetHealth
-	metadata           MetricMetadataStore
+	// 标记该target是否在线
+	health TargetHealth
+	// 记录该target抓取到的所有指标的元信息
+	metadata MetricMetadataStore
 }
 
 // NewTarget creates a reasonably configured target for querying.
@@ -154,6 +163,7 @@ func (t *Target) hash() uint64 {
 
 // offset returns the time until the next scrape cycle for the target.
 // It includes the global server jitterSeed for scrapes from multiple Prometheus to try to be at different times.
+// 通过hash打散，降低抓取的并发数
 func (t *Target) offset(interval time.Duration, jitterSeed uint64) time.Duration {
 	now := time.Now().UnixNano()
 
@@ -198,6 +208,8 @@ func (t *Target) SetDiscoveredLabels(l labels.Labels) {
 }
 
 // URL returns a copy of the target's URL.
+// 根据labels字段的schema、address、path及params确定抓取使用的URL
+// 如果label的前缀是__param_，也会被当作HTTP参数
 func (t *Target) URL() *url.URL {
 	params := url.Values{}
 
@@ -227,6 +239,7 @@ func (t *Target) URL() *url.URL {
 }
 
 // Report sets target data about the last scrape.
+// 更新最近一次抓取target的状态信息
 func (t *Target) Report(start time.Time, dur time.Duration, err error) {
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
