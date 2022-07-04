@@ -495,6 +495,7 @@ func TargetsFromGroup(tg *targetgroup.Group, cfg *config.ScrapeConfig) ([]*Targe
 
 		lset := labels.New(lbls...)
 
+		// 为target添加job、instance、__matrics_path、__scheme__、__address__等label
 		lbls, origLabels, err := PopulateLabels(lset, cfg)
 		if err != nil {
 			failures = append(failures, errors.Wrapf(err, "instance %d in group %s", i, tg))

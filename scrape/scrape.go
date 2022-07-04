@@ -219,7 +219,9 @@ func init() {
 }
 
 // scrapePool manages scrapes for sets of targets.
+// 一个scrapePool对应一个targetGroup，也就是多个scrapeLoop，因为targetGroup的每个Target都有一个对应的scrapeLoop
 type scrapePool struct {
+	// 底层存储接口
 	appendable storage.Appendable
 	logger     log.Logger
 	cancel     context.CancelFunc
@@ -227,17 +229,23 @@ type scrapePool struct {
 
 	// mtx must not be taken after targetMtx.
 	mtx    sync.Mutex
+	// prometheus.yml的scrape_configs配置
 	config *config.ScrapeConfig
+	// http客户端，scrapePool下的scrapeTarget共用该客户端
 	client *http.Client
+	// 与 activeTargets 的target对应的scrapeLoop
 	loops  map[uint64]loop
 
 	targetMtx sync.Mutex
 	// activeTargets and loops must always be synchronized to have the same
 	// set of hashes.
+	// 需要抓取的target
 	activeTargets  map[uint64]*Target
+	// 已删除的target
 	droppedTargets []*Target
 
 	// Constructor for new scrape loops. This is settable for testing convenience.
+	// 创建scrapeLoop的函数
 	newLoop func(scrapeLoopOptions) loop
 }
 
@@ -264,20 +272,24 @@ const maxAheadTime = 10 * time.Minute
 
 type labelsMutator func(labels.Labels) labels.Labels
 
+// 创建scrapePool
 func newScrapePool(cfg *config.ScrapeConfig, app storage.Appendable, jitterSeed uint64, logger log.Logger, reportExtraMetrics, passMetadataInContext bool, httpOpts []config_util.HTTPClientOption) (*scrapePool, error) {
 	targetScrapePools.Inc()
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 
+	// 创建scrapeLoop共用的http客户端
 	client, err := config_util.NewClientFromConfig(cfg.HTTPClientConfig, cfg.JobName, httpOpts...)
 	if err != nil {
 		targetScrapePoolsFailed.Inc()
 		return nil, errors.Wrap(err, "error creating HTTP client")
 	}
 
+	// 创建scrapeLoop共用的buffer
 	buffers := pool.New(1e3, 100e6, 3, func(sz int) interface{} { return make([]byte, 0, sz) })
 
+	// 所有scrapeLoop共享一个context，用于关闭所有的scrapeLoop
 	ctx, cancel := context.WithCancel(context.Background())
 	sp := &scrapePool{
 		cancel:        cancel,
@@ -289,6 +301,7 @@ func newScrapePool(cfg *config.ScrapeConfig, app storage.Appendable, jitterSeed 
 		logger:        logger,
 		httpOpts:      httpOpts,
 	}
+	// 指定创建scrapeLoop的函数，此时还未创建scrapeLoop
 	sp.newLoop = func(opts scrapeLoopOptions) loop {
 		// Update the targets retrieval function for metadata to a new scrape cache.
 		cache := opts.cache
@@ -379,6 +392,7 @@ func (sp *scrapePool) stop() {
 // reload the scrape pool with the given scrape configuration. The target state is preserved
 // but all scrape loops are restarted with the new scrape configuration.
 // This method returns after all scrape loops that were stopped have stopped scraping.
+// target保持不变，创建新的scrapeLoop，停止旧的scrapeLoop
 func (sp *scrapePool) reload(cfg *config.ScrapeConfig) error {
 	sp.mtx.Lock()
 	defer sp.mtx.Unlock()
@@ -467,6 +481,8 @@ func (sp *scrapePool) reload(cfg *config.ScrapeConfig) error {
 
 // Sync converts target groups into actual scrape targets and synchronizes
 // the currently running scraper with the resulting set and returns all scraped and dropped targets.
+// 创建scrapePool后，立即调用Sync方法
+// 从targetGroup获取最新的target，并为每个target创建scrapeLoop，每个scrapeLoop启动一个goroutine执行run方法
 func (sp *scrapePool) Sync(tgs []*targetgroup.Group) {
 	sp.mtx.Lock()
 	defer sp.mtx.Unlock()
@@ -476,6 +492,7 @@ func (sp *scrapePool) Sync(tgs []*targetgroup.Group) {
 	var all []*Target
 	sp.droppedTargets = []*Target{}
 	for _, tg := range tgs {
+		// 从targetGroup中获取target
 		targets, failures := TargetsFromGroup(tg, sp.config)
 		for _, err := range failures {
 			level.Error(sp.logger).Log("msg", "Creating target failed", "err", err)
@@ -501,6 +518,7 @@ func (sp *scrapePool) Sync(tgs []*targetgroup.Group) {
 // sync takes a list of potentially duplicated targets, deduplicates them, starts
 // scrape loops for new targets, and stops scrape loops for disappeared targets.
 // It returns after all stopped scrape loops terminated.
+// 为target创建scrapeLoop，启动单独的goroutine，停止废弃的target的goroutine
 func (sp *scrapePool) sync(targets []*Target) {
 	var (
 		uniqueLoops   = make(map[uint64]loop)
@@ -529,7 +547,9 @@ func (sp *scrapePool) sync(targets []*Target) {
 			var err error
 			interval, timeout, err = t.intervalAndTimeout(interval, timeout)
 
+			// 新的target，为其创建targetScraper
 			s := &targetScraper{Target: t, client: sp.client, timeout: timeout, bodySizeLimit: bodySizeLimit}
+			// 新的target，为其创建scrapeLoop
 			l := sp.newLoop(scrapeLoopOptions{
 				target:          t,
 				scraper:         s,
@@ -556,6 +576,7 @@ func (sp *scrapePool) sync(targets []*Target) {
 			}
 			// Need to keep the most updated labels information
 			// for displaying it in the Service Discovery web page.
+			// 已有target，则只更新discoveredLabels
 			sp.activeTargets[hash].SetDiscoveredLabels(t.DiscoveredLabels())
 		}
 	}
@@ -563,6 +584,7 @@ func (sp *scrapePool) sync(targets []*Target) {
 	var wg sync.WaitGroup
 
 	// Stop and remove old targets and scraper loops.
+	// 停止废弃的target对应的goroutine
 	for hash := range sp.activeTargets {
 		if _, ok := uniqueLoops[hash]; !ok {
 			wg.Add(1)
@@ -584,6 +606,7 @@ func (sp *scrapePool) sync(targets []*Target) {
 		l.setForcedError(forcedErr)
 	}
 	for _, l := range uniqueLoops {
+		// 启动一个单独的goroutine，执行scrapeLoop.run()方法
 		if l != nil {
 			go l.run(nil)
 		}

@@ -137,6 +137,7 @@ type Options struct {
 
 // Manager maintains a set of scrape pools and manages start/stop cycles
 // when receiving new target groups from the discovery manager.
+// 管理scrapePool及对应的targetGroup
 type Manager struct {
 	opts      *Options
 	logger    log.Logger
@@ -145,15 +146,20 @@ type Manager struct {
 
 	jitterSeed    uint64     // Global jitterSeed seed is used to spread scrape workload across HA setup.
 	mtxScrape     sync.Mutex // Guards the fields below.
+	// 抓取操作的配置信息，key为jobName，value为scrapeConfig
 	scrapeConfigs map[string]*config.ScrapeConfig
+	// scrapePool实例
 	scrapePools   map[string]*scrapePool
+	// targetGroup实例
 	targetSets    map[string][]*targetgroup.Group
 
+	// 通知reload的通道
 	triggerReload chan struct{}
 }
 
 // Run receives and saves target set updates and triggers the scraping loops reloading.
 // Reloading happens in the background so that it doesn't block receiving targets updates.
+// 监听targetGroup更新消息，通知后台goroutine进行reload
 func (m *Manager) Run(tsets <-chan map[string][]*targetgroup.Group) error {
 	go m.reloader()
 	for {
@@ -197,11 +203,13 @@ func (m *Manager) reloader() {
 	}
 }
 
+// 热更新scrapeConfig
 func (m *Manager) reload() {
 	m.mtxScrape.Lock()
 	var wg sync.WaitGroup
 	for setName, groups := range m.targetSets {
 		if _, ok := m.scrapePools[setName]; !ok {
+			// 新增targetGroup
 			scrapeConfig, ok := m.scrapeConfigs[setName]
 			if !ok {
 				level.Error(m.logger).Log("msg", "error reloading target set", "err", "invalid config id:"+setName)
@@ -218,6 +226,7 @@ func (m *Manager) reload() {
 		wg.Add(1)
 		// Run the sync in parallel as these take a while and at high load can't catch up.
 		go func(sp *scrapePool, groups []*targetgroup.Group) {
+			// 启动srapeLoop
 			sp.Sync(groups)
 			wg.Done()
 		}(m.scrapePools[setName], groups)
