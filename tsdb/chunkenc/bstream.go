@@ -47,8 +47,12 @@ import (
 )
 
 // bstream is a stream of bits.
+// 对byte数组对封装，提供按bit、byte读写的功能
 type bstream struct {
+	// 记录数据的byte数组
 	stream []byte // The data stream.
+	// 写数据时：当前byte有多少位是可以写入的
+	// 读数据时：当前byte有多少位是可以读取的
 	count  uint8  // How many right-most bits are available for writing in the current byte (the last byte of the stream).
 }
 

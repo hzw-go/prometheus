@@ -54,12 +54,15 @@ const (
 )
 
 // XORChunk holds XOR encoded sample data.
+// XORChunk 实现Chunk接口
 type XORChunk struct {
+	// 存储时序点的数据
 	b bstream
 }
 
 // NewXORChunk returns a new chunk with XOR encoding of the given size.
 func NewXORChunk() *XORChunk {
+	// 前两个byte存储时序点的个数
 	b := make([]byte, 2, 128)
 	return &XORChunk{b: bstream{stream: b, count: 0}}
 }
@@ -76,6 +79,7 @@ func (c *XORChunk) Bytes() []byte {
 
 // NumSamples returns the number of samples in the chunk.
 func (c *XORChunk) NumSamples() int {
+	// 前两个byte存储时序点的个数
 	return int(binary.BigEndian.Uint16(c.Bytes()))
 }
 
@@ -88,12 +92,14 @@ func (c *XORChunk) Compact() {
 }
 
 // Appender implements the Chunk interface.
+// Appender 创建写入器，用于向该XORChunk追加时序点
 func (c *XORChunk) Appender() (Appender, error) {
 	it := c.iterator(nil)
 
 	// To get an appender we must know the state it would have if we had
 	// appended all existing data from scratch.
 	// We iterate through the end and populate via the iterator's state.
+	// 迭代到最后一个时序点
 	for it.Next() {
 	}
 	if err := it.Err(); err != nil {
@@ -108,12 +114,14 @@ func (c *XORChunk) Appender() (Appender, error) {
 		leading:  it.leading,
 		trailing: it.trailing,
 	}
+	// 空的XORChunk，初始化leading
 	if binary.BigEndian.Uint16(a.b.bytes()) == 0 {
 		a.leading = 0xff
 	}
 	return a, nil
 }
 
+// 创建迭代器，迭代XORChunk的时序点
 func (c *XORChunk) iterator(it Iterator) *xorIterator {
 	// Should iterators guarantee to act on a copy of the data so it doesn't lock append?
 	// When using striped locks to guard access to chunks, probably yes.
@@ -136,22 +144,31 @@ func (c *XORChunk) Iterator(it Iterator) Iterator {
 	return c.iterator(it)
 }
 
+// Chunk文件写入接口实现
 type xorAppender struct {
+	// 存储时序点的数据
 	b *bstream
 
+	// 上次写入时序点的timestamp
 	t      int64
+	// 上次写入时序点的value
 	v      float64
+	// 当前点与前一个点的timestamp差值
 	tDelta uint64
 
+	// 当前XOR运算结果中前置0的个数
 	leading  uint8
+	// 当前XOR运算结果中后置0的个数
 	trailing uint8
 }
 
+// Append 向XORChunk写入时序点：按照delta-of-delta方式压缩timestamp，按照XOR方式压缩value
 func (a *xorAppender) Append(t int64, v float64) {
 	var tDelta uint64
 	num := binary.BigEndian.Uint16(a.b.bytes())
 
 	if num == 0 {
+		// 第一个时序点，需要写入完整的t、v
 		buf := make([]byte, binary.MaxVarintLen64)
 		for _, b := range buf[:binary.PutVarint(buf, t)] {
 			a.b.writeByte(b)
@@ -159,6 +176,7 @@ func (a *xorAppender) Append(t int64, v float64) {
 		a.b.writeBits(math.Float64bits(v), 64)
 
 	} else if num == 1 {
+		// 第二个时序点，记录delta，即t2-t1
 		tDelta = uint64(t - a.t)
 
 		buf := make([]byte, binary.MaxVarintLen64)
@@ -169,11 +187,14 @@ func (a *xorAppender) Append(t int64, v float64) {
 		a.writeVDelta(v)
 
 	} else {
+		// 第三个及以后的时序点
 		tDelta = uint64(t - a.t)
+		// 计算delta-of-delta
 		dod := int64(tDelta - a.tDelta)
 
 		// Gorilla has a max resolution of seconds, Prometheus milliseconds.
 		// Thus we use higher value range steps with larger bit size.
+		// delta-of-delta为0，则第一位写入0，否则写入1，同时对delta-of-delta进行变长编码
 		switch {
 		case dod == 0:
 			a.b.writeBit(zero)
@@ -194,6 +215,7 @@ func (a *xorAppender) Append(t int64, v float64) {
 		a.writeVDelta(v)
 	}
 
+	// 更新appender状态，为下一次append作准备
 	a.t = t
 	a.v = v
 	binary.BigEndian.PutUint16(a.b.bytes(), num+1)
@@ -206,7 +228,9 @@ func bitRange(x int64, nbits uint8) bool {
 	return -((1<<(nbits-1))-1) <= x && x <= 1<<(nbits-1)
 }
 
+// 向XORChunk写入value
 func (a *xorAppender) writeVDelta(v float64) {
+	// 计算当前v与上一个v的XOR值
 	vDelta := math.Float64bits(v) ^ math.Float64bits(a.v)
 
 	if vDelta == 0 {
@@ -215,6 +239,7 @@ func (a *xorAppender) writeVDelta(v float64) {
 	}
 	a.b.writeBit(one)
 
+	// 计算XOR值的leading、trailing
 	leading := uint8(bits.LeadingZeros64(vDelta))
 	trailing := uint8(bits.TrailingZeros64(vDelta))
 
@@ -224,9 +249,11 @@ func (a *xorAppender) writeVDelta(v float64) {
 	}
 
 	if a.leading != 0xff && leading >= a.leading && trailing >= a.trailing {
+		// 此次计算得到的XOR结果中间的非0部分包含在前一个XOR运算结果中，则还是以上一次XOR结果所占字节数存储本次XOR结果，节约存储一个长度的空间
 		a.b.writeBit(zero)
 		a.b.writeBits(vDelta>>a.trailing, 64-int(a.leading)-int(a.trailing))
 	} else {
+		// 用5bit存储leading zeros，6bit存储有效XOR的长度
 		a.leading, a.trailing = leading, trailing
 
 		a.b.writeBit(one)
@@ -241,6 +268,7 @@ func (a *xorAppender) writeVDelta(v float64) {
 	}
 }
 
+// 读取XORChunk的时序点（从头开始重建）
 type xorIterator struct {
 	br       bstreamReader
 	numTotal uint16
@@ -256,6 +284,7 @@ type xorIterator struct {
 	err    error
 }
 
+// Seek 跳到指定时间戳的时序点
 func (it *xorIterator) Seek(t int64) bool {
 	if it.err != nil {
 		return false
@@ -277,6 +306,7 @@ func (it *xorIterator) Err() error {
 	return it.err
 }
 
+// Reset 重置迭代器的状态，从头开始迭代
 func (it *xorIterator) Reset(b []byte) {
 	// The first 2 bytes contain chunk headers.
 	// We skip that for actual samples.
@@ -292,12 +322,14 @@ func (it *xorIterator) Reset(b []byte) {
 	it.err = nil
 }
 
+// 读取下一个时序点
 func (it *xorIterator) Next() bool {
 	if it.err != nil || it.numRead == it.numTotal {
 		return false
 	}
 
 	if it.numRead == 0 {
+		// 第一个时序点，直接读取t、v
 		t, err := binary.ReadVarint(&it.br)
 		if err != nil {
 			it.err = err
@@ -315,6 +347,7 @@ func (it *xorIterator) Next() bool {
 		return true
 	}
 	if it.numRead == 1 {
+		// 第二个时序点，读取delta，通过delta重建t
 		tDelta, err := binary.ReadUvarint(&it.br)
 		if err != nil {
 			it.err = err
@@ -328,6 +361,7 @@ func (it *xorIterator) Next() bool {
 
 	var d byte
 	// read delta-of-delta
+	// 读取dod的控制位
 	for i := 0; i < 4; i++ {
 		d <<= 1
 		bit, err := it.br.readBitFast()
@@ -343,6 +377,7 @@ func (it *xorIterator) Next() bool {
 		}
 		d |= 1
 	}
+	//读取dod
 	var sz uint8
 	var dod int64
 	switch d {
@@ -383,13 +418,16 @@ func (it *xorIterator) Next() bool {
 		dod = int64(bits)
 	}
 
+	// 通过dod重建delta，通过delta重建t
 	it.tDelta = uint64(int64(it.tDelta) + dod)
 	it.t = it.t + int64(it.tDelta)
 
 	return it.readValue()
 }
 
+// 根据XOR读取时序点的value
 func (it *xorIterator) readValue() bool {
+	// 读取第一个控制位
 	bit, err := it.br.readBitFast()
 	if err != nil {
 		bit, err = it.br.readBit()
@@ -400,8 +438,10 @@ func (it *xorIterator) readValue() bool {
 	}
 
 	if bit == zero {
+		// 与前一个val相同，无需任何操作
 		// it.val = it.val
 	} else {
+		// 读取第二个控制位
 		bit, err := it.br.readBitFast()
 		if err != nil {
 			bit, err = it.br.readBit()
@@ -413,7 +453,9 @@ func (it *xorIterator) readValue() bool {
 		if bit == zero {
 			// reuse leading/trailing zero bits
 			// it.leading, it.trailing = it.leading, it.trailing
+			// 第二个控制位为0，代表可以复用前一个leading、trailing
 		} else {
+			// 读取leading、trailing
 			bits, err := it.br.readBitsFast(5)
 			if err != nil {
 				bits, err = it.br.readBits(5)
@@ -440,6 +482,7 @@ func (it *xorIterator) readValue() bool {
 			it.trailing = 64 - it.leading - mbits
 		}
 
+		// 根据leading、trailing读取XOR
 		mbits := 64 - it.leading - it.trailing
 		bits, err := it.br.readBitsFast(mbits)
 		if err != nil {
@@ -449,6 +492,8 @@ func (it *xorIterator) readValue() bool {
 			it.err = err
 			return false
 		}
+
+		// 根据XOR和前一个值重建当前值（已知A、A XOR B，可以求B）
 		vbits := math.Float64bits(it.val)
 		vbits ^= bits << it.trailing
 		it.val = math.Float64frombits(vbits)

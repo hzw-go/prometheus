@@ -40,22 +40,28 @@ const (
 )
 
 // Chunk holds a sequence of sample pairs that can be iterated over and appended to.
+// 操作Chunk文件的接口，目前只有XORChunk实现了该接口
 type Chunk interface {
 	// Bytes returns the underlying byte slice of the chunk.
+	// 存储时序点的byte数组
 	Bytes() []byte
 
 	// Encoding returns the encoding type of the chunk.
+	// 编码类型，目前只有XOR
 	Encoding() Encoding
 
 	// Appender returns an appender to append samples to the chunk.
+	// 时序点写入接口
 	Appender() (Appender, error)
 
 	// The iterator passed as argument is for re-use.
 	// Depending on implementation, the iterator can
 	// be re-used or a new iterator can be allocated.
+	// 时序点读取接口
 	Iterator(Iterator) Iterator
 
 	// NumSamples returns the number of samples in the chunk.
+	// 时序点的个数
 	NumSamples() int
 
 	// Compact is called whenever a chunk is expected to be complete (no more
@@ -67,25 +73,31 @@ type Chunk interface {
 }
 
 // Appender adds sample pairs to a chunk.
+// 时序点写入接口
 type Appender interface {
 	Append(int64, float64)
 }
 
 // Iterator is a simple iterator that can only get the next value.
 // Iterator iterates over the samples of a time series, in timestamp-increasing order.
+// 时序点读取接口
 type Iterator interface {
 	// Next advances the iterator by one.
+	// 是否还有时序点
 	Next() bool
 	// Seek advances the iterator forward to the first sample with the timestamp equal or greater than t.
 	// If current sample found by previous `Next` or `Seek` operation already has this property, Seek has no effect.
 	// Seek returns true, if such sample exists, false otherwise.
 	// Iterator is exhausted when the Seek returns false.
+	// 将迭代器跳到指定的时间戳的时序点
 	Seek(t int64) bool
 	// At returns the current timestamp/value pair.
 	// Before the iterator has advanced At behaviour is unspecified.
+	// 返回当前时序点
 	At() (int64, float64)
 	// Err returns the current error. It should be used only after iterator is
 	// exhausted, that is `Next` or `Seek` returns false.
+	// 迭代过程中发生的异常
 	Err() error
 }
 
