@@ -111,15 +111,19 @@ func (b BlockChunkRef) Unpack() (int, int) {
 }
 
 // Meta holds information about a chunk of data.
+// 记录chunk的元数据信息
 type Meta struct {
 	// Ref and Chunk hold either a reference that can be used to retrieve
 	// chunk data or the data itself.
 	// If Chunk is nil, call ChunkReader.Chunk(Meta.Ref) to get the chunk and assign it to the Chunk field
+	// 记录chunk在磁盘上的位置信息，用于读取；存储层的writeChunks方法将chunk持久化后，会填充这个字段
 	Ref   ChunkRef
+	// XORChunk实例
 	Chunk chunkenc.Chunk
 
 	// Time range the data covers.
 	// When MaxTime == math.MaxInt64 the chunk is still open and being appended to.
+	// 记录chunk实例所覆盖的时间范围
 	MinTime, MaxTime int64
 }
 
@@ -135,6 +139,7 @@ type Iterator interface {
 }
 
 // writeHash writes the chunk encoding and raw data into the provided hash.
+// 根据chunk的encoding、bytes计算hash
 func (cm *Meta) writeHash(h hash.Hash, buf []byte) error {
 	buf = append(buf[:0], byte(cm.Chunk.Encoding()))
 	if _, err := h.Write(buf[:1]); err != nil {
@@ -147,6 +152,7 @@ func (cm *Meta) writeHash(h hash.Hash, buf []byte) error {
 }
 
 // OverlapsClosedInterval Returns true if the chunk overlaps [mint, maxt].
+// 计算给定的时间范围是否与关联chunk的时间范围有重叠
 func (cm *Meta) OverlapsClosedInterval(mint, maxt int64) bool {
 	// The chunk itself is a closed interval [cm.MinTime, cm.MaxTime].
 	return cm.MinTime <= maxt && mint <= cm.MaxTime
@@ -168,14 +174,21 @@ func newCRC32() hash.Hash32 {
 
 // Writer implements the ChunkWriter interface for the standard
 // serialization format.
+// 将内存中的时序数据（chunk）持久化到磁盘，同一时间只操作一个segment文件
 type Writer struct {
+	// 存储时序数据的目录
 	dirFile *os.File
+	// dirFile目录下存储时序数据的segment文件集合，只有最近的segment是可写的，其他segment文件只可读
 	files   []*os.File
+	// 写文件的缓冲区
 	wbuf    *bufio.Writer
+	// 当前segment文件已写入的字节数
 	n       int64
+	// 当前chunk的校验码
 	crc32   hash.Hash
 	buf     [binary.MaxVarintLen32]byte
 
+	// segment文件的大小上限
 	segmentSize int64
 }
 
@@ -196,11 +209,14 @@ func NewWriter(dir string) (*Writer, error) {
 	return newWriter(dir, DefaultChunkSegmentSize)
 }
 
+// 创建writer实例
+// when：触发compact时
 func newWriter(dir string, segmentSize int64) (*Writer, error) {
 	if segmentSize <= 0 {
 		segmentSize = DefaultChunkSegmentSize
 	}
 
+	// 创建目录（由compator指定的临时目录）
 	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return nil, err
 	}
@@ -226,11 +242,13 @@ func (w *Writer) tail() *os.File {
 // finalizeTail writes all pending data to the current tail file,
 // truncates its size, and closes it.
 func (w *Writer) finalizeTail() error {
+	// 获取当前的segment
 	tf := w.tail()
 	if tf == nil {
 		return nil
 	}
 
+	// 刷新缓冲区
 	if err := w.wbuf.Flush(); err != nil {
 		return err
 	}
@@ -238,6 +256,7 @@ func (w *Writer) finalizeTail() error {
 		return err
 	}
 	// As the file was pre-allocated, we truncate any superfluous zero bytes.
+	// 对预分配但未使用的部分进行截断
 	off, err := tf.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
@@ -249,18 +268,23 @@ func (w *Writer) finalizeTail() error {
 	return tf.Close()
 }
 
+// 切换segment文件
+// when：第一次写入；当前segment文件大小达到上限
 func (w *Writer) cut() error {
 	// Sync current tail to disk and close.
+	// 结束当前segment文件的写入
 	if err := w.finalizeTail(); err != nil {
 		return err
 	}
 
+	// 按照指定的空间大小创建新的segment文件，同时写入文件头
 	n, f, _, err := cutSegmentFile(w.dirFile, MagicChunks, chunksFormatV1, w.segmentSize)
 	if err != nil {
 		return err
 	}
 	w.n = int64(n)
 
+	// 将新的segment文件添加到w.files
 	w.files = append(w.files, f)
 	if w.wbuf != nil {
 		w.wbuf.Reset(f)
@@ -339,6 +363,7 @@ func (w *Writer) write(b []byte) error {
 // WriteChunks writes as many chunks as possible to the current segment,
 // cuts a new segment when the current segment is full and
 // writes the rest of the chunks in the new segment.
+// 持久化chunk，并赋值meta的ref字段，用于从磁盘读取时序点
 func (w *Writer) WriteChunks(chks ...Meta) error {
 	var (
 		batchSize  = int64(0)
@@ -348,6 +373,7 @@ func (w *Writer) WriteChunks(chks ...Meta) error {
 		firstBatch = true
 	)
 
+	// 确保segment文件大小不超过上限：计算每个chunk大小；保持原有顺序，将所有chunk分段，每一段创建一个segment文件
 	for i, chk := range chks {
 		// Each chunk contains: data length + encoding + the data itself + crc32
 		chkSize := int64(MaxChunkLengthFieldSize) // The data length is a variable length field so use the maximum possible value.
@@ -379,6 +405,7 @@ func (w *Writer) WriteChunks(chks ...Meta) error {
 	}
 
 	// Create a new segment when one doesn't already exist.
+	// 首次写入，创建新的segment
 	if w.n == 0 {
 		if err := w.cut(); err != nil {
 			return err
@@ -391,6 +418,7 @@ func (w *Writer) WriteChunks(chks ...Meta) error {
 		}
 		// Cut a new segment only when there are more chunks to write.
 		// Avoid creating a new empty segment at the end of the write.
+		// 为下一段chunks创建segment文件
 		if i < len(batches)-1 {
 			if err := w.cut(); err != nil {
 				return err
@@ -412,21 +440,27 @@ func (w *Writer) writeChunks(chks []Meta) error {
 	for i := range chks {
 		chk := &chks[i]
 
+		// 生成ref，本质上是一个int64，其中高32位代表文件的下标，低32位代表chunk数据在文件中的起始位置
+		// 有了文件和起始位置，就可以得到一个chunk的持久化数据了
 		chk.Ref = ChunkRef(NewBlockChunkRef(seq, uint64(w.n)))
 
 		n := binary.PutUvarint(w.buf[:], uint64(len(chk.Chunk.Bytes())))
 
+		// 记录chunk数据所占字节数
 		if err := w.write(w.buf[:n]); err != nil {
 			return err
 		}
+		// 记录chunk数据的编码格式
 		w.buf[0] = byte(chk.Chunk.Encoding())
 		if err := w.write(w.buf[:1]); err != nil {
 			return err
 		}
+		// 将byte数组原封不动地写入
 		if err := w.write(chk.Chunk.Bytes()); err != nil {
 			return err
 		}
 
+		// 记录chunk数据的crc32校验码
 		w.crc32.Reset()
 		if err := chk.writeHash(w.crc32, w.buf[:]); err != nil {
 			return err
@@ -469,12 +503,17 @@ func (b realByteSlice) Range(start, end int) []byte {
 
 // Reader implements a ChunkReader for a serialized byte stream
 // of series data.
+// 从磁盘读取到内存，并封装为chunk实例
 type Reader struct {
 	// The underlying bytes holding the encoded series data.
 	// Each slice holds the data for a different segment.
+	// ByteSlice是对byte数组的封装
+	// 每个ByteSlice实例代表一个segment文件的数据
 	bs   []ByteSlice
+	// 每个Closer对应一个segment文件，与bs一一对应
 	cs   []io.Closer // Closers for resources behind the byte slices.
 	size int64       // The total size of bytes in the reader.
+	// 存储可重用的chunk实例
 	pool chunkenc.Pool
 }
 
@@ -500,6 +539,7 @@ func newReader(bs []ByteSlice, cs []io.Closer, pool chunkenc.Pool) (*Reader, err
 
 // NewDirReader returns a new Reader against sequentially numbered files in the
 // given directory.
+// 将指定目录下的所有segment文件通过mmap映射到虚拟内存
 func NewDirReader(dir string, pool chunkenc.Pool) (*Reader, error) {
 	files, err := sequenceFiles(dir)
 	if err != nil {
@@ -545,7 +585,9 @@ func (s *Reader) Size() int64 {
 }
 
 // Chunk returns a chunk from a given reference.
+// 根据ref获取chunk
 func (s *Reader) Chunk(ref ChunkRef) (chunkenc.Chunk, error) {
+	// 从ref中获取segment文件下标、chunk在该segment的字节偏移量
 	sgmIndex, chkStart := BlockChunkRef(ref).Unpack()
 	chkCRC32 := newCRC32()
 
@@ -553,6 +595,7 @@ func (s *Reader) Chunk(ref ChunkRef) (chunkenc.Chunk, error) {
 		return nil, errors.Errorf("segment index %d out of range", sgmIndex)
 	}
 
+	// 获取到了segment文件在内存中的字节数组
 	sgmBytes := s.bs[sgmIndex]
 
 	if chkStart+MaxChunkLengthFieldSize > sgmBytes.Len() {
@@ -561,6 +604,7 @@ func (s *Reader) Chunk(ref ChunkRef) (chunkenc.Chunk, error) {
 	// With the minimum chunk length this should never cause us reading
 	// over the end of the slice.
 	c := sgmBytes.Range(chkStart, chkStart+MaxChunkLengthFieldSize)
+	// 获取chunk所占字节数
 	chkDataLen, n := binary.Uvarint(c)
 	if n <= 0 {
 		return nil, errors.Errorf("reading chunk length failed with %d", n)
@@ -575,6 +619,7 @@ func (s *Reader) Chunk(ref ChunkRef) (chunkenc.Chunk, error) {
 		return nil, errors.Errorf("segment doesn't include enough bytes to read the chunk - required:%v, available:%v", chkEnd, sgmBytes.Len())
 	}
 
+	// 划定chunk的数据
 	sum := sgmBytes.Range(chkDataEnd, chkEnd)
 	if _, err := chkCRC32.Write(sgmBytes.Range(chkEncStart, chkDataEnd)); err != nil {
 		return nil, err
@@ -584,11 +629,13 @@ func (s *Reader) Chunk(ref ChunkRef) (chunkenc.Chunk, error) {
 		return nil, errors.Errorf("checksum mismatch expected:%x, actual:%x", sum, act)
 	}
 
+	// 封装chunk
 	chkData := sgmBytes.Range(chkDataStart, chkDataEnd)
 	chkEnc := sgmBytes.Range(chkEncStart, chkEncStart+ChunkEncodingSize)[0]
 	return s.pool.Get(chunkenc.Encoding(chkEnc), chkData)
 }
 
+// 计算下一个segment文件的名称
 func nextSequenceFile(dir string) (string, int, error) {
 	files, err := os.ReadDir(dir)
 	if err != nil {

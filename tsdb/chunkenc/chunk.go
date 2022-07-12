@@ -40,7 +40,7 @@ const (
 )
 
 // Chunk holds a sequence of sample pairs that can be iterated over and appended to.
-// 操作Chunk文件的接口，目前只有XORChunk实现了该接口
+// 操作Chunk的接口，目前只有XORChunk实现了该接口
 type Chunk interface {
 	// Bytes returns the underlying byte slice of the chunk.
 	// 存储时序点的byte数组
@@ -150,6 +150,7 @@ type Pool interface {
 }
 
 // pool is a memory pool of chunk objects.
+// 在sync.Pool之上进行封装，确保类型安全（sync.Pool可put任意类型）
 type pool struct {
 	xor sync.Pool
 }

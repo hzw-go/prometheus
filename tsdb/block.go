@@ -101,6 +101,7 @@ type IndexReader interface {
 }
 
 // ChunkWriter serializes a time block of chunked series data.
+// 持久化chunk到磁盘
 type ChunkWriter interface {
 	// WriteChunks writes several chunks. The Chunk field of the ChunkMetas
 	// must be populated.
@@ -114,6 +115,7 @@ type ChunkWriter interface {
 }
 
 // ChunkReader provides reading access of serialized time series data.
+// 从磁盘读取到chunk
 type ChunkReader interface {
 	// Chunk returns the series data chunk with the given reference.
 	Chunk(ref chunks.ChunkRef) (chunkenc.Chunk, error)

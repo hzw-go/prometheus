@@ -54,7 +54,7 @@ const (
 )
 
 // XORChunk holds XOR encoded sample data.
-// XORChunk 实现Chunk接口
+// XORChunk 实现Chunk接口。本质上是一个byte数组，存储内存中的时序点，并同时提供时序点的读写方法
 type XORChunk struct {
 	// 存储时序点的数据
 	b bstream
