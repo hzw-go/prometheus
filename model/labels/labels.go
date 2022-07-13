@@ -43,6 +43,9 @@ type Label struct {
 // instantiation.
 type Labels []Label
 
+// 按照label的name对多个label排序
+// 为什么value不参与排序？这个排序只是针对一个labels内部对label进行排序，并非多个labels间对排序
+
 func (ls Labels) Len() int           { return len(ls) }
 func (ls Labels) Swap(i, j int)      { ls[i], ls[j] = ls[j], ls[i] }
 func (ls Labels) Less(i, j int) bool { return ls[i].Name < ls[j].Name }
@@ -360,6 +363,8 @@ func FromStrings(ss ...string) Labels {
 
 // Compare compares the two label sets.
 // The result will be 0 if a==b, <0 if a < b, and >0 if a > b.
+// 比较连个labels。逐个对比每个label对name、value
+// 对series排序时，会调用compare
 func Compare(a, b Labels) int {
 	l := len(a)
 	if len(b) < l {

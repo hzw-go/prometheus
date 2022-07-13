@@ -174,7 +174,7 @@ func newCRC32() hash.Hash32 {
 
 // Writer implements the ChunkWriter interface for the standard
 // serialization format.
-// 将内存中的时序数据（chunk）持久化到磁盘，同一时间只操作一个segment文件
+// 将内存中的时序数据（chunk）持久化到磁盘。操作对象是一个目录下的多个segment文件，但同一时间只操作一个segment文件
 type Writer struct {
 	// 存储时序数据的目录
 	dirFile *os.File
@@ -503,7 +503,7 @@ func (b realByteSlice) Range(start, end int) []byte {
 
 // Reader implements a ChunkReader for a serialized byte stream
 // of series data.
-// 从磁盘读取到内存，并封装为chunk实例
+// 从磁盘读取到内存，并封装为chunk实例。操作对象是多个segment文件对应的byte数组
 type Reader struct {
 	// The underlying bytes holding the encoded series data.
 	// Each slice holds the data for a different segment.

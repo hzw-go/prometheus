@@ -43,6 +43,7 @@ func (m MatchType) String() string {
 }
 
 // Matcher models the matching of a label.
+// label的匹配器，匹配给定的value
 type Matcher struct {
 	Type  MatchType
 	Name  string
