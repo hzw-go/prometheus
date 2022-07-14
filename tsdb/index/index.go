@@ -52,6 +52,8 @@ const (
 	indexFilename = "index"
 )
 
+// index对series的抽象
+// 唯一确定一个series
 type indexWriterSeries struct {
 	labels labels.Labels
 	chunks []chunks.Meta // series file offset of chunks
@@ -112,36 +114,49 @@ type symbolCacheEntry struct {
 
 // Writer implements the IndexWriter interface for the standard
 // serialization format.
+// 序列化index
 type Writer struct {
 	ctx context.Context
 
 	// For the main index file.
+	// index文件
 	f *FileWriter
 
 	// Temporary file for postings.
+	// 临时文件，存储posting
 	fP *FileWriter
 	// Temporary file for posting offsets table.
-	fPO   *FileWriter
+	// 临时文件，存储offset table
+	fPO *FileWriter
+	// posting的个数
 	cntPO uint64
 
-	toc           TOC
+	// 各个部分的位置
+	toc TOC
+	// 当前处于哪一个阶段：未开始、写symbol、写series、完成
 	stage         indexWriterStage
 	postingsStart uint64 // Due to padding, can differ from TOC entry.
 
 	// Reusable memory.
+	// 可重用的缓冲区
 	buf1 encoding.Encbuf
 	buf2 encoding.Encbuf
 
-	numSymbols  int
-	symbols     *Symbols
-	symbolFile  *fileutil.MmapFile
+	// symbol的个数
+	numSymbols int
+	symbols    *Symbols
+	symbolFile *fileutil.MmapFile
+	// 最近一次写入的symbol，用于保证写入的symbol是有序的
 	lastSymbol  string
 	symbolCache map[string]symbolCacheEntry
 
+	// 记录label name及其label index的位置
 	labelIndexes []labelIndexHashEntry // Label index offsets.
-	labelNames   map[string]uint64     // Label names, and their usage.
+	// k为label name，value为包含该label name的series的个数
+	labelNames map[string]uint64 // Label names, and their usage.
 
 	// Hold last series to validate that clients insert new series in order.
+	// 最近一次写入的series，用于保证写入的series是有序的
 	lastSeries labels.Labels
 	lastRef    storage.SeriesRef
 
@@ -151,6 +166,8 @@ type Writer struct {
 }
 
 // TOC represents index Table Of Content that states where each section of index starts.
+// index对TOC的抽象
+// 记录各个部分在文件中的位置
 type TOC struct {
 	Symbols           uint64
 	Series            uint64
@@ -189,6 +206,8 @@ func NewTOCFromByteSlice(bs ByteSlice) (*TOC, error) {
 }
 
 // NewWriter returns a new Writer to the given filename. It serializes data in format version 2.
+// 删除已存在的index，创建新index文件及其他临时文件，并写入文件头
+// 发生在compaction期间
 func NewWriter(ctx context.Context, fn string) (*Writer, error) {
 	dir := filepath.Dir(fn)
 
@@ -338,6 +357,9 @@ func (fw *FileWriter) Remove() error {
 
 // ensureStage handles transitions between write stages and ensures that IndexWriter
 // methods are called in an order valid for the implementation.
+// 确保各个阶段按正常顺序推进
+// 更新TOC中各部分的位置
+// 如果已完成，进行收尾工作
 func (w *Writer) ensureStage(s indexWriterStage) error {
 	select {
 	case <-w.ctx.Done():
@@ -375,27 +397,33 @@ func (w *Writer) ensureStage(s indexWriterStage) error {
 		w.toc.LabelIndices = w.f.pos
 		// LabelIndices generation depends on the posting offset
 		// table produced at this stage.
+		// 读取index文件的series，构建postings、offset table，并写入临时文件
 		if err := w.writePostingsToTmpFiles(); err != nil {
 			return err
 		}
+		// 读取临时文件的offset table，构建label index
 		if err := w.writeLabelIndices(); err != nil {
 			return err
 		}
 
 		w.toc.Postings = w.f.pos
+		// 将postings临时文件拷贝到index文件
 		if err := w.writePostings(); err != nil {
 			return err
 		}
 
 		w.toc.LabelIndicesTable = w.f.pos
+		// 写入label index offset（写label index记录了label name -> label index offset映射）
 		if err := w.writeLabelIndexesOffsetTable(); err != nil {
 			return err
 		}
 
 		w.toc.PostingsTable = w.f.pos
+		// 将offset table临时文件拷贝到index文件
 		if err := w.writePostingsOffsetTable(); err != nil {
 			return err
 		}
+		// 将TOC写入index文件
 		if err := w.writeTOC(); err != nil {
 			return err
 		}
@@ -414,10 +442,51 @@ func (w *Writer) writeMeta() error {
 }
 
 // AddSeries adds the series one at a time along with its chunks.
+// 向index文件写series
+// 发生在compaction期间
+// ref表示此series是当前block的第几个series
+/*
+┌──────────────────────────────────────────────────────────────────────────┐
+│ len <uvarint>                                                            │
+├──────────────────────────────────────────────────────────────────────────┤
+│ ┌──────────────────────────────────────────────────────────────────────┐ │
+│ │                     labels count <uvarint64>                         │ │
+│ ├──────────────────────────────────────────────────────────────────────┤ │
+│ │              ┌────────────────────────────────────────────┐          │ │
+│ │              │ ref(l_i.name) <uvarint32>                  │          │ │
+│ │              ├────────────────────────────────────────────┤          │ │
+│ │              │ ref(l_i.value) <uvarint32>                 │          │ │
+│ │              └────────────────────────────────────────────┘          │ │
+│ │                             ...                                      │ │
+│ ├──────────────────────────────────────────────────────────────────────┤ │
+│ │                     chunks count <uvarint64>                         │ │
+│ ├──────────────────────────────────────────────────────────────────────┤ │
+│ │              ┌────────────────────────────────────────────┐          │ │
+│ │              │ c_0.mint <varint64>                        │          │ │
+│ │              ├────────────────────────────────────────────┤          │ │
+│ │              │ c_0.maxt - c_0.mint <uvarint64>            │          │ │
+│ │              ├────────────────────────────────────────────┤          │ │
+│ │              │ ref(c_0.data) <uvarint64>                  │          │ │
+│ │              └────────────────────────────────────────────┘          │ │
+│ │              ┌────────────────────────────────────────────┐          │ │
+│ │              │ c_i.mint - c_i-1.maxt <uvarint64>          │          │ │
+│ │              ├────────────────────────────────────────────┤          │ │
+│ │              │ c_i.maxt - c_i.mint <uvarint64>            │          │ │
+│ │              ├────────────────────────────────────────────┤          │ │
+│ │              │ ref(c_i.data) - ref(c_i-1.data) <varint64> │          │ │
+│ │              └────────────────────────────────────────────┘          │ │
+│ │                             ...                                      │ │
+│ └──────────────────────────────────────────────────────────────────────┘ │
+├──────────────────────────────────────────────────────────────────────────┤
+│ CRC32 <4b>                                                               │
+└──────────────────────────────────────────────────────────────────────────┘
+*/
 func (w *Writer) AddSeries(ref storage.SeriesRef, lset labels.Labels, chunks ...chunks.Meta) error {
+	// 推进状态
 	if err := w.ensureStage(idxStageSeries); err != nil {
 		return err
 	}
+	// 判断是否按顺序写入series
 	if labels.Compare(lset, w.lastSeries) <= 0 {
 		return errors.Errorf("out-of-order series added with label set %q", lset)
 	}
@@ -427,6 +496,7 @@ func (w *Writer) AddSeries(ref storage.SeriesRef, lset labels.Labels, chunks ...
 	}
 	// We add padding to 16 bytes to increase the addressable space we get through 4 byte
 	// series references.
+	// 确保当前写入位置是16字节对齐
 	if err := w.addPadding(16); err != nil {
 		return errors.Errorf("failed to write padding bytes: %v", err)
 	}
@@ -436,10 +506,12 @@ func (w *Writer) AddSeries(ref storage.SeriesRef, lset labels.Labels, chunks ...
 	}
 
 	w.buf2.Reset()
+	// 写入label个数
 	w.buf2.PutUvarint(len(lset))
 
 	for _, l := range lset {
 		var err error
+		// 获取label name在Symbol Table的编号
 		cacheEntry, ok := w.symbolCache[l.Name]
 		nameIndex := cacheEntry.index
 		if !ok {
@@ -449,8 +521,11 @@ func (w *Writer) AddSeries(ref storage.SeriesRef, lset labels.Labels, chunks ...
 			}
 		}
 		w.labelNames[l.Name]++
+		// 写入label name的ST编号
 		w.buf2.PutUvarint32(nameIndex)
 
+		// 获取label value在Symbol Table的编号
+		// 按顺序写的好处，复用上一次的结果，减少许多重复计算
 		valueIndex := cacheEntry.lastValueIndex
 		if !ok || cacheEntry.lastValue != l.Value {
 			valueIndex, err = w.symbols.ReverseLookup(l.Value)
@@ -463,12 +538,15 @@ func (w *Writer) AddSeries(ref storage.SeriesRef, lset labels.Labels, chunks ...
 				lastValueIndex: valueIndex,
 			}
 		}
+		// 写入label value的ST编号
 		w.buf2.PutUvarint32(valueIndex)
 	}
 
+	// 写入chunk的个数
 	w.buf2.PutUvarint(len(chunks))
 
 	if len(chunks) > 0 {
+		// 第一个chunk，完整写入
 		c := chunks[0]
 		w.buf2.PutVarint64(c.MinTime)
 		w.buf2.PutUvarint64(uint64(c.MaxTime - c.MinTime))
@@ -476,6 +554,9 @@ func (w *Writer) AddSeries(ref storage.SeriesRef, lset labels.Labels, chunks ...
 		t0 := c.MaxTime
 		ref0 := int64(c.Ref)
 
+		// 第二个及以后的chunk，只写入差值
+		// Q：无论差值还是原始值，都是int64，既然没有节省空间，那么为什么要保存差值呢？
+		// A：底层调用的是binary.PutVarint，该函数会根据数值的大小按需写入，数值越小，存储所需的字节越少
 		for _, c := range chunks[1:] {
 			w.buf2.PutUvarint64(uint64(c.MinTime - t0))
 			w.buf2.PutUvarint64(uint64(c.MaxTime - c.MinTime))
@@ -487,14 +568,18 @@ func (w *Writer) AddSeries(ref storage.SeriesRef, lset labels.Labels, chunks ...
 	}
 
 	w.buf1.Reset()
+	// 计算series总长度，写入buf1，在下文会把buf1的内容写入该series的起始位置
 	w.buf1.PutUvarint(w.buf2.Len())
 
+	// 计算校验码
 	w.buf2.PutHash(w.crc32)
 
+	// 将buf数据刷到index文件
 	if err := w.write(w.buf1.Get(), w.buf2.Get()); err != nil {
 		return errors.Wrap(err, "write series data")
 	}
 
+	// 保存状态
 	w.lastSeries = append(w.lastSeries[:0], lset...)
 	w.lastRef = ref
 
@@ -508,6 +593,8 @@ func (w *Writer) startSymbols() error {
 	return w.write([]byte("alenblen"))
 }
 
+// AddSymbol 向index文件写入symbol
+// 发生在创建新index文件时，即compaction
 func (w *Writer) AddSymbol(sym string) error {
 	if err := w.ensureStage(idxStageSymbols); err != nil {
 		return err
@@ -515,9 +602,11 @@ func (w *Writer) AddSymbol(sym string) error {
 	if w.numSymbols != 0 && sym <= w.lastSymbol {
 		return errors.Errorf("symbol %q out-of-order", sym)
 	}
+	// 更新元数据
 	w.lastSymbol = sym
 	w.numSymbols++
 	w.buf1.Reset()
+	// 写入字符串长度、内容
 	w.buf1.PutUvarintStr(sym)
 	return w.write(w.buf1.Get())
 }
@@ -620,12 +709,30 @@ func (w *Writer) writeLabelIndices() error {
 	return nil
 }
 
+// 写label index（label name与label value的映射）
+/*
+┌───────────────┬────────────────┬────────────────┐
+│ len <4b>      │ #names <4b>    │ #entries <4b>  │
+├───────────────┴────────────────┴────────────────┤
+│ ┌─────────────────────────────────────────────┐ │
+│ │ ref(value_0) <4b>                           │ │
+│ ├─────────────────────────────────────────────┤ │
+│ │ ...                                         │ │
+│ ├─────────────────────────────────────────────┤ │
+│ │ ref(value_n) <4b>                           │ │
+│ └─────────────────────────────────────────────┘ │
+│                      . . .                      │
+├─────────────────────────────────────────────────┤
+│ CRC32 <4b>                                      │
+└─────────────────────────────────────────────────┘
+*/
 func (w *Writer) writeLabelIndex(name string, values []uint32) error {
 	// Align beginning to 4 bytes for more efficient index list scans.
 	if err := w.addPadding(4); err != nil {
 		return err
 	}
 
+	// 记录label name与label index起始位置的映射，label index的起始位置即当前位置
 	w.labelIndexes = append(w.labelIndexes, labelIndexHashEntry{
 		keys:   []string{name},
 		offset: w.f.pos,
@@ -639,13 +746,16 @@ func (w *Writer) writeLabelIndex(name string, values []uint32) error {
 	w.crc32.Reset()
 
 	w.buf1.Reset()
+	// 写入label name的个数
 	w.buf1.PutBE32int(1) // Number of names.
+	// 写入label value的个数
 	w.buf1.PutBE32int(len(values))
 	w.buf1.WriteToHash(w.crc32)
 	if err := w.write(w.buf1.Get()); err != nil {
 		return err
 	}
 
+	// 写入value在ST的编号
 	for _, v := range values {
 		w.buf1.Reset()
 		w.buf1.PutBE32(v)
@@ -662,12 +772,14 @@ func (w *Writer) writeLabelIndex(name string, values []uint32) error {
 		return errors.Errorf("label index size exceeds 4 bytes: %d", l)
 	}
 	w.buf1.PutBE32int(int(l))
+	// 写入label index的字节数
 	if err := w.writeAt(w.buf1.Get(), startPos); err != nil {
 		return err
 	}
 
 	w.buf1.Reset()
 	w.buf1.PutHashSum(w.crc32)
+	// 写入校验码
 	return w.write(w.buf1.Get())
 }
 
@@ -814,6 +926,7 @@ func (w *Writer) writeTOC() error {
 	return w.write(w.buf1.Get())
 }
 
+// 根据series解析出postings、offset table，并写入临时文件
 func (w *Writer) writePostingsToTmpFiles() error {
 	names := make([]string, 0, len(w.labelNames))
 	for n := range w.labelNames {
@@ -824,6 +937,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 	if err := w.f.Flush(); err != nil {
 		return err
 	}
+	// 打开index文件，此时文件里可以读到所有的Symbol Table、Series
 	f, err := fileutil.OpenMmapFile(w.f.name)
 	if err != nil {
 		return err
@@ -880,6 +994,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 
 		d := encoding.NewDecbufRaw(realByteSlice(f.Bytes()), int(w.toc.LabelIndices))
 		d.Skip(int(w.toc.Series))
+		// 遍历index文件里的series，重建postings，即Label name -> label value -> positions的映射关系
 		for d.Len() > 0 {
 			d.ConsumePadding()
 			startPos := w.toc.LabelIndices - uint64(d.Len())
@@ -906,6 +1021,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 			}
 		}
 
+		// 有了Label name -> label value -> positions，就可以写入postings、offset table了
 		for _, name := range batchNames {
 			// Write out postings for this label name.
 			sid, err := w.symbols.ReverseLookup(name)
@@ -923,6 +1039,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 				if err != nil {
 					return err
 				}
+				// 写入postings、offset table
 				if err := w.writePosting(name, value, postings[sid][v]); err != nil {
 					return err
 				}
@@ -938,6 +1055,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 	return nil
 }
 
+// postings和offset table都在这里写入
 func (w *Writer) writePosting(name, value string, offs []uint32) error {
 	// Align beginning to 4 bytes for more efficient postings list scans.
 	if err := w.fP.AddPadding(4); err != nil {
@@ -945,6 +1063,25 @@ func (w *Writer) writePosting(name, value string, offs []uint32) error {
 	}
 
 	// Write out postings offset table to temporary file as we go.
+	// 将offset table写入存储offset table的临时文件
+	/*
+		┌─────────────────────┬──────────────────────┐
+		│ len <4b>            │ #entries <4b>        │
+		├─────────────────────┴──────────────────────┤
+		│ ┌────────────────────────────────────────┐ │
+		│ │  n = 2 <1b>                            │ │
+		│ ├──────────────────────┬─────────────────┤ │
+		│ │ len(name) <uvarint>  │ name <bytes>    │ │
+		│ ├──────────────────────┼─────────────────┤ │
+		│ │ len(value) <uvarint> │ value <bytes>   │ │
+		│ ├──────────────────────┴─────────────────┤ │
+		│ │  offset <uvarint64>                    │ │
+		│ └────────────────────────────────────────┘ │
+		│                    . . .                   │
+		├────────────────────────────────────────────┤
+		│  CRC32 <4b>                                │
+		└────────────────────────────────────────────┘
+	*/
 	w.buf1.Reset()
 	w.buf1.PutUvarint(2)
 	w.buf1.PutUvarintStr(name)
@@ -958,6 +1095,22 @@ func (w *Writer) writePosting(name, value string, offs []uint32) error {
 	w.buf1.Reset()
 	w.buf1.PutBE32int(len(offs))
 
+	// 将postings写入存储postings的临时文件
+	/*
+		┌────────────────────┬────────────────────┐
+		│ len <4b>           │ #entries <4b>      │
+		├────────────────────┴────────────────────┤
+		│ ┌─────────────────────────────────────┐ │
+		│ │ ref(series_1) <4b>                  │ │
+		│ ├─────────────────────────────────────┤ │
+		│ │ ...                                 │ │
+		│ ├─────────────────────────────────────┤ │
+		│ │ ref(series_n) <4b>                  │ │
+		│ └─────────────────────────────────────┘ │
+		├─────────────────────────────────────────┤
+		│ CRC32 <4b>                              │
+		└─────────────────────────────────────────┘
+	*/
 	for _, off := range offs {
 		if off > (1<<32)-1 {
 			return errors.Errorf("series offset %d exceeds 4 bytes", off)
@@ -998,8 +1151,6 @@ func (w *Writer) writePostings() error {
 	if uint64(n) != w.fP.pos {
 		return errors.Errorf("wrote %d bytes to posting temporary file, but only read back %d", w.fP.pos, n)
 	}
-	w.f.pos += uint64(n)
-
 	if err := w.fP.Close(); err != nil {
 		return err
 	}

@@ -39,9 +39,11 @@ import (
 
 // IndexWriter serializes the index for a block of series data.
 // The methods must be called in the order they are specified in.
+// 定义了序列化index文件的方法
 type IndexWriter interface {
 	// AddSymbols registers all string symbols that are encountered in series
 	// and other indices. Symbols must be added in sorted order.
+	// 将出现的字符串写入Symbol Table，必须按照顺序写
 	AddSymbol(sym string) error
 
 	// AddSeries populates the index writer with a series and its offsets
@@ -49,6 +51,7 @@ type IndexWriter interface {
 	// Implementations may require series to be insert in strictly increasing order by
 	// their labels. The reference numbers are used to resolve entries in postings lists
 	// that are added later.
+	// 写入series的数据
 	AddSeries(ref storage.SeriesRef, l labels.Labels, chunks ...chunks.Meta) error
 
 	// Close writes any finalization and closes the resources associated with
