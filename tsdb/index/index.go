@@ -357,9 +357,8 @@ func (fw *FileWriter) Remove() error {
 
 // ensureStage handles transitions between write stages and ensures that IndexWriter
 // methods are called in an order valid for the implementation.
-// 确保各个阶段按正常顺序推进
+// 确保各个阶段按正常顺序推进：1，写symbol。2，写series。3，写label index、posting、offset table、toc
 // 更新TOC中各部分的位置
-// 如果已完成，进行收尾工作
 func (w *Writer) ensureStage(s indexWriterStage) error {
 	select {
 	case <-w.ctx.Done():
@@ -1209,19 +1208,25 @@ type StringIter interface {
 	Err() error
 }
 
+// Reader 实现了indexReader接口
 type Reader struct {
-	b   ByteSlice
+	// byte数组，存储了用mmap打开的index文件内容
+	b ByteSlice
+	// 用于存储读取的TOC
 	toc *TOC
 
 	// Close that releases the underlying resources of the byte slice.
+	// 通过mmap打开的index文件
 	c io.Closer
 
 	// Map of LabelName to a list of some LabelValues's position in the offset table.
 	// The first and last values for each name are always present.
+	// 记录了posting offset，即（label name，label value）-> offset映射
 	postings map[string][]postingOffset
 	// For the v1 format, labelname -> labelvalue -> offset.
 	postingsV1 map[string]map[string]uint64
 
+	// 用于存储读取的Symbols
 	symbols     *Symbols
 	nameSymbols map[uint32]string // Cache of the label name symbol lookups,
 	// as there are not many and they are half of all lookups.
@@ -1299,17 +1304,20 @@ func newReader(b ByteSlice, c io.Closer) (*Reader, error) {
 		return nil, errors.Errorf("unknown index file version %d", r.version)
 	}
 
+	// 解析TOC
 	var err error
 	r.toc, err = NewTOCFromByteSlice(b)
 	if err != nil {
 		return nil, errors.Wrap(err, "read TOC")
 	}
 
+	// 解析Symbols
 	r.symbols, err = NewSymbols(r.b, r.version, int(r.toc.Symbols))
 	if err != nil {
 		return nil, errors.Wrap(err, "read symbols")
 	}
 
+	// 解析offset table，构造posting，即（label name，label value）-> offset映射
 	if r.version == FormatV1 {
 		// Earlier V1 formats don't have a sorted postings offset table, so
 		// load the whole offset table into memory.
@@ -1425,6 +1433,7 @@ type Symbols struct {
 	version int
 	off     int
 
+	// 字符串的起始位置，和已排序的字符串一一对应，可用于二分查找
 	offsets []int
 	seen    int
 }
@@ -1432,6 +1441,8 @@ type Symbols struct {
 const symbolFactor = 32
 
 // NewSymbols returns a Symbols object for symbol lookups.
+// 解析symbols，构建offset数组，用于二分查找
+// 相较于v1，v2不存储字符串，节省了存储symbols的空间（v1版本存储的是offset->string的映射）
 func NewSymbols(bs ByteSlice, version, off int) (*Symbols, error) {
 	s := &Symbols{
 		bs:      bs,
@@ -1646,6 +1657,8 @@ func (r *Reader) LabelValues(name string, matchers ...*labels.Matcher) ([]string
 		return values, nil
 
 	}
+	// 获取所有（label value，offset）
+	// todo 为什么不能直接用这里的label value？
 	e, ok := r.postings[name]
 	if !ok {
 		return nil, nil
@@ -1754,6 +1767,8 @@ func (r *Reader) LabelValueFor(id storage.SeriesRef, label string) (string, erro
 }
 
 // Series reads the series with the given ID and writes its labels and chunks into lbls and chks.
+// 拿到posting后，根据series id即series的offset读取series信息，并通过decoder解析series
+// 有个chunk元数据，就可以通过chunkReader读取chunk文件，返回时序点
 func (r *Reader) Series(id storage.SeriesRef, lbls *labels.Labels, chks *[]chunks.Meta) error {
 	offset := id
 	// In version 2 series IDs are no longer exact references but series are 16-byte padded
@@ -1768,6 +1783,8 @@ func (r *Reader) Series(id storage.SeriesRef, lbls *labels.Labels, chks *[]chunk
 	return errors.Wrap(r.dec.Series(d.Get(), lbls, chks), "read series")
 }
 
+// Postings v1的做法是直接查找postingsV1，即label name -> label value -> posting映射
+// todo v2
 func (r *Reader) Postings(name string, values ...string) (Postings, error) {
 	if r.version == FormatV1 {
 		e, ok := r.postingsV1[name]
@@ -1924,7 +1941,9 @@ func (s stringListIter) Err() error { return nil }
 //
 // It currently does not contain decoding methods for all entry types but can be extended
 // by them if there's demand.
+// 封装了symbols数据，提供了解析label index、postings、series的方法
 type Decoder struct {
+	// 通过给方法赋值，间接引用了reader的symbols数据（被赋值的方法引用了reader.symbols）
 	LookupSymbol func(uint32) (string, error)
 }
 
@@ -1993,6 +2012,7 @@ func (dec *Decoder) LabelValueFor(b []byte, label string) (string, error) {
 }
 
 // Series decodes a series entry from the given byte slice into lset and chks.
+// 解析series
 func (dec *Decoder) Series(b []byte, lbls *labels.Labels, chks *[]chunks.Meta) error {
 	*lbls = (*lbls)[:0]
 	*chks = (*chks)[:0]

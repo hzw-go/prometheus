@@ -60,13 +60,17 @@ type IndexWriter interface {
 }
 
 // IndexReader provides reading access of serialized index data.
+// 定义了读取index文件的方法
 type IndexReader interface {
 	// Symbols return an iterator over sorted string symbols that may occur in
 	// series' labels and indices. It is not safe to use the returned strings
 	// beyond the lifetime of the index reader.
+	// 返回symbol的迭代器
 	Symbols() index.StringIter
 
 	// SortedLabelValues returns sorted possible label values.
+	// 根据label name、条件查找label values
+	// todo why possible values？
 	SortedLabelValues(name string, matchers ...*labels.Matcher) ([]string, error)
 
 	// LabelValues returns possible label values which may not be sorted.
@@ -76,27 +80,33 @@ type IndexReader interface {
 	// The Postings here contain the offsets to the series inside the index.
 	// Found IDs are not strictly required to point to a valid Series, e.g.
 	// during background garbage collections. Input values must be sorted.
+	// 根据label查找postings
 	Postings(name string, values ...string) (index.Postings, error)
 
 	// SortedPostings returns a postings list that is reordered to be sorted
 	// by the label set of the underlying series.
+	// 对postings排序。持久化的postings已经是有序的，原封不动返回即可；内存中的postings需要反查series label set进行排序
 	SortedPostings(index.Postings) index.Postings
 
 	// Series populates the given labels and chunk metas for the series identified
 	// by the reference.
 	// Returns storage.ErrNotFound if the ref does not resolve to a known series.
+	// 根据seriesRef查找series
 	Series(ref storage.SeriesRef, lset *labels.Labels, chks *[]chunks.Meta) error
 
 	// LabelNames returns all the unique label names present in the index in sorted order.
+	// 根据条件查找label name
 	LabelNames(matchers ...*labels.Matcher) ([]string, error)
 
 	// LabelValueFor returns label value for the given label name in the series referred to by ID.
 	// If the series couldn't be found or the series doesn't have the requested label a
 	// storage.ErrNotFound is returned as error.
+	// 根据label name、seriesRef查找label value
 	LabelValueFor(id storage.SeriesRef, label string) (string, error)
 
 	// LabelNamesFor returns all the label names for the series referred to by IDs.
 	// The names returned are sorted.
+	// 根据seriesRef查找label name
 	LabelNamesFor(ids ...storage.SeriesRef) ([]string, error)
 
 	// Close releases the underlying resources of the reader.
