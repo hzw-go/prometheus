@@ -247,6 +247,18 @@ names记录label name的个数，通常为1；entries记录value的个数；接�
 ### TOC
 Table Of Content，存储各部分在index文件中的偏移量
 
+# WAL
+不影响写性能的同时，保证宕机不丢数据
+## 核心组件
+- 一个Record记录一条WAL日志
+- 多个Record组成一个page，每个page大小为32KB
+- 多个page组成一个segment，segment即WAL日志文件，每个segment大小为128MB
+- 一条Record可以跨多个page存储，但不能跨两个segment
+- segment文件名是一个递增的编号，存储层会定时清理过期的WAL文件
+
+
+
+
 
 
 
@@ -263,3 +275,4 @@ Table Of Content，存储各部分在index文件中的偏移量
 ```
 ｜ 可能是chunk有大小限制、时间间隔限制，使得一个series的时序点分成了多个chunk
 - 如何通过编号在Symbol Table中寻找字符串
+- 什么时候需要打开index文件

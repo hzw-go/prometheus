@@ -51,10 +51,18 @@ var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 // Records bigger than the page size are split and flushed separately.
 // A flush is triggered when a single records doesn't fit the page size or
 // when the next record can't fit in the remaining free page space.
+// 内存缓冲区
+// 什么场景会触发刷新到磁盘的操作呢？
+// 1，完成批量写
+// 2，当前page已满
+// 3，当前page不足以写下当前record
 type page struct {
-	alloc   int
+	// 当前page已经使用的字节数
+	alloc int
+	// 刷新到磁盘的字节数
 	flushed int
-	buf     [pageSize]byte
+	// 存储当前page的数据
+	buf [pageSize]byte
 }
 
 func (p *page) remaining() int {
@@ -83,7 +91,11 @@ type SegmentFile interface {
 }
 
 // Segment represents a segment file.
+// WAL日志文件
+// 对os.File进行包装，内嵌了os.File提供读写能力，同时记录了WAL文件所在的目录及编号
 type Segment struct {
+	// 内嵌了一个接口
+	// 从字段角度看，接口是结构体下级，因为可通过同名字段接收实现该接口的结构体。从层次上来看却与结构体同级，因为对外可直接调用接口定义的方法
 	SegmentFile
 	dir string
 	i   int
@@ -173,19 +185,28 @@ func OpenReadSegment(fn string) (*Segment, error) {
 // Records are never split across segments to allow full segments to be
 // safely truncated. It also ensures that torn writes never corrupt records
 // beyond the most recent segment.
+// 管理多个segment，负责segment的读写、切分
 type WAL struct {
-	dir         string
-	logger      log.Logger
+	// WAL日志所在的目录
+	dir    string
+	logger log.Logger
+	// 每个segment文件大小的上限，默认128M
 	segmentSize int
-	mtx         sync.RWMutex
-	segment     *Segment // Active segment.
-	donePages   int      // Pages written to the segment.
-	page        *page    // Active page.
-	stopc       chan chan struct{}
-	actorc      chan func()
-	closed      bool // To allow calling Close() more than once without blocking.
-	compress    bool
-	snappyBuf   []byte
+	// 写日志时，需要获取锁
+	mtx sync.RWMutex
+	// 当前正在写入的segment
+	segment *Segment // Active segment.
+	// 当前segment写入的page个数
+	donePages int // Pages written to the segment.
+	// 当前正在写入的page
+	page *page // Active page.
+	// 通知关闭WAL的通道，下游会进行一些刷盘操作
+	stopc chan chan struct{}
+	// 通知切换segment文件的通道
+	actorc    chan func()
+	closed    bool // To allow calling Close() more than once without blocking.
+	compress  bool
+	snappyBuf []byte
 
 	metrics *walMetrics
 }
@@ -255,10 +276,12 @@ func New(logger log.Logger, reg prometheus.Registerer, dir string, compress bool
 
 // NewSize returns a new WAL over the given directory.
 // New segments are created with the specified size.
+// 初始化WAL
 func NewSize(logger log.Logger, reg prometheus.Registerer, dir string, segmentSize int, compress bool) (*WAL, error) {
 	if segmentSize%pageSize != 0 {
 		return nil, errors.New("invalid segment size")
 	}
+	// 创建目录，目录已存在时不报错
 	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return nil, errors.Wrap(err, "create dir")
 	}
@@ -276,6 +299,7 @@ func NewSize(logger log.Logger, reg prometheus.Registerer, dir string, segmentSi
 	}
 	w.metrics = newWALMetrics(reg)
 
+	// 读取目录，返回最后一个segment
 	_, last, err := Segments(w.Dir())
 	if err != nil {
 		return nil, errors.Wrap(err, "get segment range")
@@ -288,11 +312,13 @@ func NewSize(logger log.Logger, reg prometheus.Registerer, dir string, segmentSi
 		writeSegmentIndex = last + 1
 	}
 
+	// 打开最后一个segment
 	segment, err := CreateSegment(w.Dir(), writeSegmentIndex)
 	if err != nil {
 		return nil, err
 	}
 
+	// 更新segment元数据
 	if err := w.setSegment(segment); err != nil {
 		return nil, err
 	}
@@ -467,27 +493,33 @@ func (w *WAL) NextSegment() error {
 }
 
 // nextSegment creates the next segment and closes the previous one.
+// 当当前segment的空间不够时，切换到新的segment
 func (w *WAL) nextSegment() error {
 	if w.closed {
 		return errors.New("wal is closed")
 	}
 
 	// Only flush the current page if it actually holds data.
+	// 将page未刷盘的数据刷盘
 	if w.page.alloc > 0 {
 		if err := w.flushPage(true); err != nil {
 			return err
 		}
 	}
+	// 创建新的segment文件
 	next, err := CreateSegment(w.Dir(), w.segment.Index()+1)
 	if err != nil {
 		return errors.Wrap(err, "create new segment file")
 	}
+	// 更新segment元数据
 	prev := w.segment
 	if err := w.setSegment(next); err != nil {
 		return err
 	}
 
 	// Don't block further writes by fsyncing the last segment.
+	// 通知actorc，异步完成上一个segment文件的刷盘
+	// 由另一个goroutine执行上一个segment文件的刷盘操作，不会阻塞当前segment的写入
 	w.actorc <- func() {
 		if err := w.fsync(prev); err != nil {
 			level.Error(w.logger).Log("msg", "sync previous segment", "err", err)
@@ -587,7 +619,9 @@ func (w *WAL) pagesPerSegment() int {
 
 // Log writes the records into the log.
 // Multiple records can be passed at once to reduce writes and increase throughput.
+// 写WAL日志的入口，可批量写
 func (w *WAL) Log(recs ...[]byte) error {
+	// 获取锁，保证并发安全
 	w.mtx.Lock()
 	defer w.mtx.Unlock()
 	// Callers could just implement their own list record format but adding
@@ -605,6 +639,10 @@ func (w *WAL) Log(recs ...[]byte) error {
 // - the final record of a batch
 // - the record is bigger than the page size
 // - the current page is full.
+// 以下情况会触发刷盘
+// 1，完成一批日志的写入
+// 2，当前page写不下某一条日志（可能会导致一条record部分成功部分失败，目前还没有解决办法）
+// 3，page已满
 func (w *WAL) log(rec []byte, final bool) error {
 	// When the last page flush failed the page will remain full.
 	// When the page is full, need to flush it before trying to add more records to it.
@@ -615,6 +653,7 @@ func (w *WAL) log(rec []byte, final bool) error {
 	}
 
 	// Compress the record before calculating if a new segment is needed.
+	// 压缩日志
 	compressed := false
 	if w.compress &&
 		len(rec) > 0 &&
@@ -634,9 +673,12 @@ func (w *WAL) log(rec []byte, final bool) error {
 	// If the record is too big to fit within the active page in the current
 	// segment, terminate the active segment and advance to the next one.
 	// This ensures that records do not cross segment boundaries.
-	left := w.page.remaining() - recordHeaderSize                                   // Free space in the active page.
+	// 计算当前page的空闲空间
+	left := w.page.remaining() - recordHeaderSize // Free space in the active page.
+	// 计算当前segment的空闲空间
 	left += (pageSize - recordHeaderSize) * (w.pagesPerSegment() - w.donePages - 1) // Free pages in the active segment.
 
+	// 如果当segment写不下record，则切换到新的segment继续写入
 	if len(rec) > left {
 		if err := w.nextSegment(); err != nil {
 			return err
@@ -645,6 +687,7 @@ func (w *WAL) log(rec []byte, final bool) error {
 
 	// Populate as many pages as necessary to fit the record.
 	// Be careful to always do one pass to ensure we write zero-length records.
+	// 一个record可以跨多个page
 	for i := 0; i == 0 || len(rec) > 0; i++ {
 		p := w.page
 
@@ -670,6 +713,7 @@ func (w *WAL) log(rec []byte, final bool) error {
 			typ |= snappyMask
 		}
 
+		// 写入状态、长度、校验码、日志内容
 		buf[0] = byte(typ)
 		crc := crc32.Checksum(part, castagnoliTable)
 		binary.BigEndian.PutUint16(buf[1:], uint16(len(part)))
@@ -716,6 +760,7 @@ func (w *WAL) LastSegmentAndOffset() (seg, offset int, err error) {
 }
 
 // Truncate drops all segments before i.
+// 删除文件名小于指定编号的WAL文件
 func (w *WAL) Truncate(i int) (err error) {
 	w.metrics.truncateTotal.Inc()
 	defer func() {
@@ -768,6 +813,8 @@ func (w *WAL) Close() (err error) {
 		}
 	}
 
+	// 双向通信
+	// 向通道里发送通道，下游处理完成后，通过关闭通道（或者向通道发送数据）通知发起方下游已经处理完成
 	donec := make(chan struct{})
 	w.stopc <- donec
 	<-donec
