@@ -24,13 +24,21 @@ import (
 )
 
 // Reader reads WAL records from an io.Reader.
+//
+// 读取并解码WAL日志的结构体，负责从rdr中读取数据、切分WAL日志（这里不做解析）
 type Reader struct {
-	rdr       io.Reader
-	err       error
+	// 可顺序读取WAL日志的数据流，具体实现是可读取多个segment的segmentBufReader
+	rdr io.Reader
+	err error
+	// Record的缓冲区
+	// 由于有多种record，这里只解析成字节数组，由下游解析成具体的WAL日志
 	rec       []byte
 	snappyBuf []byte
-	buf       [pageSize]byte
-	total     int64   // Total bytes processed.
+	// 读取page的缓冲区
+	buf [pageSize]byte
+	// 已读取的字节总数
+	total int64 // Total bytes processed.
+	// 上一条record的类型，用于检查日志的完整性
 	curRecTyp recType // Used for checking that the last record is not torn.
 }
 
@@ -59,14 +67,18 @@ func (r *Reader) Next() bool {
 func (r *Reader) next() (err error) {
 	// We have to use r.buf since allocating byte arrays here fails escape
 	// analysis and ends up on the heap, even though it seemingly should not.
+	// 读取头信息
 	hdr := r.buf[:recordHeaderSize]
+	// 读取record信息
 	buf := r.buf[recordHeaderSize:]
 
+	// 初始化缓冲区
 	r.rec = r.rec[:0]
 	r.snappyBuf = r.snappyBuf[:0]
 
 	i := 0
 	for {
+		// 解析头信息
 		if _, err = io.ReadFull(r.rdr, hdr[:1]); err != nil {
 			return errors.Wrap(err, "read first header byte")
 		}
@@ -75,6 +87,7 @@ func (r *Reader) next() (err error) {
 		compressed := hdr[0]&snappyMask != 0
 
 		// Gobble up zero bytes.
+		// recPageTerm代表page余下部分都是空字节
 		if r.curRecTyp == recPageTerm {
 			// recPageTerm is a single byte that indicates the rest of the page is padded.
 			// If it's the first byte in a page, buf is too small and
@@ -84,10 +97,12 @@ func (r *Reader) next() (err error) {
 			// We are pedantic and check whether the zeros are actually up
 			// to a page boundary.
 			// It's not strictly necessary but may catch sketchy state early.
+			// 读到了page末尾
 			k := pageSize - (r.total % pageSize)
 			if k == pageSize {
 				continue // Initial 0 byte was last page byte.
 			}
+			// 未读到page末尾，则将剩余字节全部读出来
 			n, err := io.ReadFull(r.rdr, buf[:k])
 			if err != nil {
 				return errors.Wrap(err, "read remaining zeros")
@@ -107,6 +122,7 @@ func (r *Reader) next() (err error) {
 		}
 		r.total += int64(n)
 
+		// 解析record头信息
 		var (
 			length = binary.BigEndian.Uint16(hdr[1:])
 			crc    = binary.BigEndian.Uint32(hdr[3:])
@@ -115,6 +131,7 @@ func (r *Reader) next() (err error) {
 		if length > pageSize-recordHeaderSize {
 			return errors.Errorf("invalid record size %d", length)
 		}
+		// 读取record数据
 		n, err = io.ReadFull(r.rdr, buf[:length])
 		if err != nil {
 			return err

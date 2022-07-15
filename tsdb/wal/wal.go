@@ -371,6 +371,8 @@ Loop:
 
 // Repair attempts to repair the WAL based on the error.
 // It discards all data after the corruption.
+// 如果segment文件损坏，Repair最大程度恢复可用的record
+// 将损坏点之后的所有数据删除，保存余下可以的record
 func (w *WAL) Repair(origErr error) error {
 	// We could probably have a mode that only discards torn records right around
 	// the corruption to preserve as data much as possible.
@@ -378,7 +380,7 @@ func (w *WAL) Repair(origErr error) error {
 	// Maybe as an extra mode in the future if mid-WAL corruptions become
 	// a frequent concern.
 	err := errors.Cause(origErr) // So that we can pick up errors even if wrapped.
-
+	// 转换成记录了损坏点的CorruptionErr
 	cerr, ok := err.(*CorruptionErr)
 	if !ok {
 		return errors.Wrap(origErr, "cannot handle error")
@@ -406,6 +408,7 @@ func (w *WAL) Repair(origErr error) error {
 				return errors.Wrap(err, "close active segment")
 			}
 		}
+		// 跳过损坏点之前的segment
 		if s.index <= cerr.Segment {
 			continue
 		}
@@ -421,10 +424,12 @@ func (w *WAL) Repair(origErr error) error {
 	fn := SegmentName(w.Dir(), cerr.Segment)
 	tmpfn := fn + ".repair"
 
+	// 重命名损坏的segment文件
 	if err := fileutil.Rename(fn, tmpfn); err != nil {
 		return err
 	}
 	// Create a clean segment and make it the active one.
+	// 创建与损坏的segment文件同名的segment文件，用于记录可用的record
 	s, err := CreateSegment(w.Dir(), cerr.Segment)
 	if err != nil {
 		return err
@@ -439,6 +444,7 @@ func (w *WAL) Repair(origErr error) error {
 	}
 	defer f.Close()
 
+	// 创建Reader，读取WAL日志
 	r := NewReader(bufio.NewReader(f))
 
 	for r.Next() {
@@ -446,6 +452,7 @@ func (w *WAL) Repair(origErr error) error {
 		if r.Offset() >= cerr.Offset {
 			break
 		}
+		// 拷贝可用的record
 		if err := w.Log(r.Record()); err != nil {
 			return errors.Wrap(err, "insert record")
 		}
@@ -463,6 +470,7 @@ func (w *WAL) Repair(origErr error) error {
 	if err := f.Close(); err != nil {
 		return errors.Wrap(err, "close corrupted file")
 	}
+	// 删除损坏的segment文件
 	if err := os.Remove(tmpfn); err != nil {
 		return errors.Wrap(err, "delete corrupted segment")
 	}
@@ -473,6 +481,7 @@ func (w *WAL) Repair(origErr error) error {
 	// We always want to start writing to a new Segment rather than an existing
 	// Segment, which is handled by NewSize, but earlier in Repair we're deleting
 	// all segments that come after the corrupted Segment. Recreate a new Segment here.
+	// 不使用修复好的segment日志，而是创建一个新的segment，作为active segment
 	s, err = CreateSegment(w.Dir(), cerr.Segment+1)
 	if err != nil {
 		return err
@@ -915,11 +924,17 @@ func NewSegmentsRangeReader(sr ...SegmentRange) (io.ReadCloser, error) {
 // corruption reporting.  We have to be careful not to increment curr too
 // early, as it is used by Reader.Err() to tell Repair which segment is corrupt.
 // As such we pad the end of non-page align segments with zeros.
+// 读取WAL日志的结构体，对外是一个可以顺序读取所有WAL日志的数据流，但不提供解码
+// 可一次读取多个page，可连续读取多个segment
 type segmentBufReader struct {
-	buf  *bufio.Reader
+	// 读取segment文件时用的缓冲区
+	buf *bufio.Reader
+	// 可读取的segment文件
 	segs []*Segment
-	cur  int // Index into segs.
-	off  int // Offset of read data into current segment.
+	// 正在读取的segment文件编号
+	cur int // Index into segs.
+	// 当前segment以读取的字节数
+	off int // Offset of read data into current segment.
 }
 
 // nolint:revive // TODO: Consider exporting segmentBufReader
@@ -960,6 +975,8 @@ func (r *segmentBufReader) Close() (err error) {
 }
 
 // Read implements io.Reader.
+// 实现了Reader接口，对外是一个可以不断读取字节数组的对象，无关解码逻辑
+// 将缓冲区的内容读到指定的字节数组中，当前segment读取完成后，自动切换到下一个segment
 func (r *segmentBufReader) Read(b []byte) (n int, err error) {
 	if len(r.segs) == 0 {
 		return 0, io.EOF
