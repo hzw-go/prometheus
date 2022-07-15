@@ -31,6 +31,7 @@ import (
 // Type represents the data type of a record.
 type Type uint8
 
+// 所有的WAL日志类型
 const (
 	// Unknown is returned for unrecognised WAL record types.
 	Unknown Type = 255
@@ -70,6 +71,7 @@ type RefExemplar struct {
 
 // Decoder decodes series, sample, and tombstone records.
 // The zero value is ready to use.
+// record编码器
 type Decoder struct{}
 
 // Type returns the type of the record.
@@ -86,17 +88,22 @@ func (d *Decoder) Type(rec []byte) Type {
 }
 
 // Series appends series in rec to the given slice.
+// 将字节数组解码成WAL Series日志
 func (d *Decoder) Series(rec []byte, series []RefSeries) ([]RefSeries, error) {
 	dec := encoding.Decbuf{B: rec}
 
+	// 读取record类型
 	if Type(dec.Byte()) != Series {
 		return nil, errors.New("invalid record type")
 	}
 	for len(dec.B) > 0 && dec.Err() == nil {
+		// 读取seriesRef
 		ref := storage.SeriesRef(dec.Be64())
 
+		// 读取label数量
 		lset := make(labels.Labels, dec.Uvarint())
 
+		// 读取label pair
 		for i := range lset {
 			lset[i].Name = dec.UvarintStr()
 			lset[i].Value = dec.UvarintStr()
@@ -118,9 +125,11 @@ func (d *Decoder) Series(rec []byte, series []RefSeries) ([]RefSeries, error) {
 }
 
 // Samples appends samples in rec to the given slice.
+// 将字节数组解码成WAL Samples日志
 func (d *Decoder) Samples(rec []byte, samples []RefSample) ([]RefSample, error) {
 	dec := encoding.Decbuf{B: rec}
 
+	// 读取record类型
 	if Type(dec.Byte()) != Samples {
 		return nil, errors.New("invalid record type")
 	}
@@ -128,12 +137,16 @@ func (d *Decoder) Samples(rec []byte, samples []RefSample) ([]RefSample, error) 
 		return samples, nil
 	}
 	var (
+		// 读取基准seriesRef、time
+		// 一个samples record可以存储多个sample，存储偏移量可以节省空间
 		baseRef  = dec.Be64()
 		baseTime = dec.Be64int64()
 	)
 	for len(dec.B) > 0 && dec.Err() == nil {
+		// 读取seriesRef、time的偏移量
 		dref := dec.Varint64()
 		dtime := dec.Varint64()
+		// 读取value
 		val := dec.Be64()
 
 		samples = append(samples, RefSample{
@@ -153,15 +166,19 @@ func (d *Decoder) Samples(rec []byte, samples []RefSample) ([]RefSample, error) 
 }
 
 // Tombstones appends tombstones in rec to the given slice.
+// 将字节数组解码成WAL Tombstones日志
 func (d *Decoder) Tombstones(rec []byte, tstones []tombstones.Stone) ([]tombstones.Stone, error) {
 	dec := encoding.Decbuf{B: rec}
 
+	// 读取record类型
 	if Type(dec.Byte()) != Tombstones {
 		return nil, errors.New("invalid record type")
 	}
 	for dec.Len() > 0 && dec.Err() == nil {
 		tstones = append(tstones, tombstones.Stone{
+			// 读取seriesRef
 			Ref: storage.SeriesRef(dec.Be64()),
+			// 读取Interval
 			Intervals: tombstones.Intervals{
 				{Mint: dec.Varint64(), Maxt: dec.Varint64()},
 			},
@@ -176,6 +193,7 @@ func (d *Decoder) Tombstones(rec []byte, tstones []tombstones.Stone) ([]tombston
 	return tstones, nil
 }
 
+// 将字节数组解码成WAL Exemplars日志
 func (d *Decoder) Exemplars(rec []byte, exemplars []RefExemplar) ([]RefExemplar, error) {
 	dec := encoding.Decbuf{B: rec}
 	t := Type(dec.Byte())
@@ -191,15 +209,20 @@ func (d *Decoder) ExemplarsFromBuffer(dec *encoding.Decbuf, exemplars []RefExemp
 		return exemplars, nil
 	}
 	var (
+		// 读取基准seriesRef、time
 		baseRef  = dec.Be64()
 		baseTime = dec.Be64int64()
 	)
 	for len(dec.B) > 0 && dec.Err() == nil {
+		// 读取seriesRef、time偏移量
 		dref := dec.Varint64()
 		dtime := dec.Varint64()
+		// 读取value
 		val := dec.Be64()
 
+		// 读取label个数
 		lset := make(labels.Labels, dec.Uvarint())
+		// 读取label pair
 		for i := range lset {
 			lset[i].Name = dec.UvarintStr()
 			lset[i].Value = dec.UvarintStr()
@@ -225,6 +248,7 @@ func (d *Decoder) ExemplarsFromBuffer(dec *encoding.Decbuf, exemplars []RefExemp
 
 // Encoder encodes series, sample, and tombstones records.
 // The zero value is ready to use.
+// record编码器
 type Encoder struct{}
 
 // Series appends the encoded series to b and returns the resulting slice.

@@ -31,7 +31,7 @@ type Reader struct {
 	rdr io.Reader
 	err error
 	// Record的缓冲区
-	// 由于有多种record，这里只解析成字节数组，由下游解析成具体的WAL日志
+	// 由于有多种record，这里只解析成字节数组，由record.go的Decoder解析成具体的WAL日志
 	rec       []byte
 	snappyBuf []byte
 	// 读取page的缓冲区
